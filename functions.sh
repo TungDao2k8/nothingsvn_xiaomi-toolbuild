@@ -1,94 +1,43 @@
 #!/bin/bash
-WORK_DIR=$(pwd)
+# SPDX-License-Identifier: GPL-3.0
+# functions.sh — NothingsVN AutoBuild shared library
 
-mods() {
-    if [ "$#" -eq 1 ] ; then
-        echo -e [MODS] - $1
-    else
-        echo "Usage: mods <string>"
-    fi
+set -euo pipefail
+
+WORK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ─── Bin dir (dynamic OS + arch, no hardcode) ────────────────────────────────
+BIN_ARCH="${WORK_DIR}/bin/$(uname)/$(uname -m)"
+
+# ─── Logging ─────────────────────────────────────────────────────────────────
+_log() { echo -e "[${1}] - ${2}"; }
+
+mods()        { [[ $# -eq 1 ]] && _log "MODS"          "$1" || echo "Usage: mods <string>"; }
+info()        { [[ $# -eq 1 ]] && _log "INFO"          "$1" || echo "Usage: info <string>"; }
+warn()        { [[ $# -eq 1 ]] && _log "WARN"          "$1" || echo "Usage: warn <string>"; }
+error()       { [[ $# -eq 1 ]] && _log "ERROR"         "$1" || echo "Usage: error <string>"; }
+unpack()      { [[ $# -eq 1 ]] && _log "UNPACK"        "$1" || echo "Usage: unpack <string>"; }
+unpack_erofs(){ [[ $# -eq 1 ]] && _log "UNPACK-EROFS"  "$1" || echo "Usage: unpack_erofs <string>"; }
+unpack_ext()  { [[ $# -eq 1 ]] && _log "UNPACK-EXT4"   "$1" || echo "Usage: unpack_ext <string>"; }
+repack()      { [[ $# -eq 1 ]] && _log "REPACK"        "$1" || echo "Usage: repack <string>"; }
+upload()      { [[ $# -eq 1 ]] && _log "UPLOADING"     "$1" || echo "Usage: upload <string>"; }
+patch()       { [[ $# -eq 1 ]] && _log "PATCH"         "$1" || echo "Usage: patch <string>"; }
+
+# ─── Version / branch detection ──────────────────────────────────────────────
+load_version() {
+    polyxver="$(cat "${WORK_DIR}/Version")"
+    local branch
+    branch="$(git -C "${WORK_DIR}" branch --show-current 2>/dev/null || echo 'main')"
+    [[ "$branch" == "beta" ]] && status="Development" || status="Official"
+    export polyxver status
 }
 
-info() {
-    if [ "$#" -eq 1 ] ; then
-        echo -e [INFO] - $1
-    else
-        echo "Usage: info <string>"
-    fi
-}
-
-warn() {
-    if [ "$#" -eq 1 ] ; then
-        echo -e [WARN] - $1
-    else
-        echo "Usage: warn <string>"
-    fi
-}
-
-error() {
-    if [ "$#" -eq 1 ] ; then
-        echo -e [ERROR] - $1
-    else
-        echo "Usage: error <string>"
-    fi
-}
-
-unpack() {
-    if [ "$#" -eq 1 ] ; then
-        echo -e [UNPACK] - $1
-    else
-        echo "Usage: unpack <string>"
-    fi
-}
-
-unpack_erofs() {
-    if [ "$#" -eq 1 ] ; then
-        echo -e [UNPACK - EROFS] - $1
-    else
-        echo "Usage: unpack_erofs <string>"
-    fi
-}
-
-unpack_ext() {
-    if [ "$#" -eq 1 ] ; then
-        echo -e [UNPACK - EXT4] - $1
-    else
-        echo "Usage: unpack_ext <string>"
-    fi
-}
-
-repack() {
-    if [ "$#" -eq 1 ] ; then
-        echo -e [REPACK] - $1
-    else
-        echo "Usage: repack <string>"
-    fi
-}
-
-upload() {
-    if [ "$#" -eq 1 ] ; then
-        echo -e [UPLOADING] - $1
-    else
-        echo "Usage: upload <string>"
-    fi
-}
-
-patch() {
-    if [ "$#" -eq 1 ] ; then
-        echo -e [PATCH] - $1
-    else
-        echo "Usage: patch <string>"
-    fi
-}
-
-# Check for required dependencies
-exists() {
-    command -v "$1" > /dev/null 2>&1
-}
+# ─── Dependency check ────────────────────────────────────────────────────────
+exists() { command -v "$1" >/dev/null 2>&1; }
 
 abort() {
-    yellow "--> Missing $1 ! installing..."
-    apt install $1 -y
+    warn "Missing '$1', installing..."
+    sudo apt-get install -y "$1" || { error "Failed to install '$1'"; exit 1; }
 }
 
 check() {
@@ -97,113 +46,159 @@ check() {
     done
 }
 
-# Check for a prop's existence
-is_property_exists () {
-    if [ $(grep -c "$1" "$2") -ne 0 ] ; then
-        return 0
-    else
-        return 1
-    fi
+# ─── Property helpers ────────────────────────────────────────────────────────
+is_property_exists() {
+    grep -q "$1" "$2"
 }
 
+# ─── AVB / encryption removal ────────────────────────────────────────────────
 disable_avb_verify() {
-    fstab_files=$(find "$1" -type f -name "*fstab*")
-    info "Disabling avb_verify in files: $fstab_files"
-    if [[ -z "$fstab_files" ]]; then
-        warn "No fstab files found in $1"
-        return
+    local dir="$1"
+    local fstab_files
+    mapfile -t fstab_files < <(find "$dir" -type f -name "*fstab*")
+
+    if [[ ${#fstab_files[@]} -eq 0 ]]; then
+        warn "No fstab files found in $dir"; return
     fi
-    for fstab in $fstab_files; do
-        if [[ -f $fstab ]]; then
-            info "Processing $fstab"
-		    sed -i "s/,avb_keys=.*avbpubkey//g" $fstab
-            sed -i "s/,avb=vbmeta_system//g" $fstab
-		    sed -i "s/,avb=vbmeta_vendor//g" $fstab
-            sed -i "s/,avb=vbmeta//g" $fstab
-            sed -i "s/,avb//g" $fstab
-            sed -i 's/,avb.*system//g' $fstab
-            sed -i 's/,avb,/,/g' $fstab
-            sed -i 's/,avb=.*a,/,/g' $fstab
-            sed -i 's/,avb_keys.*key//g' $fstab
-        else
-            warn "$fstab not found, please check it manually"
-        fi
+
+    info "Disabling avb_verify in ${#fstab_files[@]} fstab file(s)"
+    for fstab in "${fstab_files[@]}"; do
+        [[ -f "$fstab" ]] || { warn "$fstab not found"; continue; }
+        sed -i \
+            -e 's/,avb_keys=[^,]*avbpubkey//g' \
+            -e 's/,avb=vbmeta_system//g'        \
+            -e 's/,avb=vbmeta_vendor//g'        \
+            -e 's/,avb=vbmeta//g'               \
+            -e 's/,avb\b//g'                    \
+            -e 's/,avb.*system//g'              \
+            -e 's/,avb,/,/g'                    \
+            -e 's/,avb=.*a,/,/g'               \
+            -e 's/,avb_keys[^,]*key//g'         \
+            "$fstab"
     done
 }
 
 remove_data_encrypt() {
-    fstab_files=$(find "$1" -type f -name "*fstab*")
-    info "Disabling data enc in files: $fstab_files"
-    if [[ -z "$fstab_files" ]]; then
-        yellow "No fstab files found in $1"
-        return
+    local dir="$1"
+    local fstab_files
+    mapfile -t fstab_files < <(find "$dir" -type f -name "*fstab*")
+
+    if [[ ${#fstab_files[@]} -eq 0 ]]; then
+        warn "No fstab files found in $dir"; return
     fi
-    for fstab in $fstab_files; do
-        if [[ -f $fstab ]]; then
-            sed -i "s/,fileencryption=aes-256-xts:aes-256-cts:v2+inlinecrypt_optimized+wrappedkey_v0//g" $fstab
-            sed -i "s/,fileencryption=aes-256-xts:aes-256-cts:v2+emmc_optimized+wrappedkey_v0//g" $fstab
-            sed -i "s/,fileencryption=aes-256-xts:aes-256-cts:v2//g" $fstab
-            sed -i "s/,metadata_encryption=aes-256-xts:wrappedkey_v0//g" $fstab
-            sed -i "s/,fileencryption=aes-256-xts:wrappedkey_v0//g" $fstab
-            sed -i "s/,metadata_encryption=aes-256-xts//g" $fstab
-            sed -i "s/,fileencryption=aes-256-xts//g" $fstab
-            sed -i "s/fileencryption/encryptable/g" $fstab
-            sed -i "s/,fileencryption=ice//g" $fstab
-        else
-            yellow "$fstab not found, please check it manually"
-        fi
+
+    info "Disabling data encryption in ${#fstab_files[@]} fstab file(s)"
+    for fstab in "${fstab_files[@]}"; do
+        [[ -f "$fstab" ]] || { warn "$fstab not found"; continue; }
+        sed -i \
+            -e 's/,fileencryption=aes-256-xts:aes-256-cts:v2+inlinecrypt_optimized+wrappedkey_v0//g' \
+            -e 's/,fileencryption=aes-256-xts:aes-256-cts:v2+emmc_optimized+wrappedkey_v0//g'       \
+            -e 's/,fileencryption=aes-256-xts:aes-256-cts:v2//g'                                    \
+            -e 's/,metadata_encryption=aes-256-xts:wrappedkey_v0//g'                                \
+            -e 's/,fileencryption=aes-256-xts:wrappedkey_v0//g'                                     \
+            -e 's/,metadata_encryption=aes-256-xts//g'                                              \
+            -e 's/,fileencryption=aes-256-xts//g'                                                   \
+            -e 's/fileencryption/encryptable/g'                                                      \
+            -e 's/,fileencryption=ice//g'                                                            \
+            "$fstab"
     done
 }
 
+# ─── Partition extraction ─────────────────────────────────────────────────────
+# FIX: dùng ${BIN_ARCH} thay vì hardcode Linux/x86_64
 extract_partition() {
-    part_img=$1
-    part_name=$(basename ${part_img})
-    target_dir=$2
-    if [[ -f ${part_img} ]]; then 
-        if [[ $(${WORK_DIR}/bin/Linux/x86_64/gettype -i ${part_img}) == "ext" ]]; then
-            pack_type="EXT"
-            echo $pack_type > ${WORK_DIR}/bin/ddevice/fstype.txt
-            sudo python3 ${WORK_DIR}/bin/imgextractor/imgextractor.py ${part_img} ${target_dir} >/dev/null 2>&1 || { error "Extracting ${part_name} failed."; exit 1; }
-            unpack "File ${part_name} extracted."
-            rm -rf ${part_img}      
-        elif [[ $(${WORK_DIR}/bin/Linux/x86_64/gettype -i ${part_img}) == "erofs" ]]; then
-            pack_type="EROFS"
-            echo $pack_type > ${WORK_DIR}/bin/ddevice/fstype.txt
-            extract.erofs -x -i ${part_img} -o ${target_dir} > /dev/null 2>&1 || { error "Extracting ${part_name} failed." ; exit 1; }
-            unpack "File ${part_name} extracted."
-            rm -rf ${part_img}
-        else
-            error "Unable to handle img, exit."
+    local part_img="$1"
+    local target_dir="$2"
+    local part_name
+    part_name="$(basename "${part_img}")"
+
+    [[ -f "${part_img}" ]] || return 0
+
+    # Validate binary exists before calling
+    [[ -x "${BIN_ARCH}/gettype" ]] || { error "gettype not found at ${BIN_ARCH}/gettype"; exit 1; }
+
+    local fs_type
+    fs_type="$("${BIN_ARCH}/gettype" -i "${part_img}")"
+
+    case "${fs_type}" in
+        ext)
+            echo "EXT" > "${WORK_DIR}/bin/ddevice/fstype.txt"
+            python3 "${WORK_DIR}/bin/imgextractor/imgextractor.py" \
+                "${part_img}" "${target_dir}" >/dev/null 2>&1 \
+                || { error "Extracting ${part_name} failed."; exit 1; }
+            unpack "File ${part_name} extracted. [EXT4]"
+            ;;
+        erofs)
+            echo "EROFS" > "${WORK_DIR}/bin/ddevice/fstype.txt"
+            # FIX: dùng BIN_ARCH dynamic, không hardcode
+            [[ -x "${BIN_ARCH}/extract.erofs" ]] || { error "extract.erofs not found at ${BIN_ARCH}"; exit 1; }
+            "${BIN_ARCH}/extract.erofs" -x -i "${part_img}" -o "${target_dir}" >/dev/null 2>&1 \
+                || { error "Extracting ${part_name} failed."; exit 1; }
+            unpack "File ${part_name} extracted. [EROFS]"
+            ;;
+        *)
+            error "Unknown filesystem type '${fs_type}' for ${part_name}, cannot handle."
             exit 1
-        fi
-    fi    
+            ;;
+    esac
+
+    rm -f "${part_img}"
 }
 
-setprop_rc() {
-    local target_section="$1"    # e.g., "on boot"
-    local insert_value="$2"      # e.g., "setprop com.exx.c true"
-    local file="$3"              # e.g., "a.rc"
+# ─── build.prop helpers ──────────────────────────────────────────────────────
+change_prop() {
+    local key="$1"
+    local new_value="$2"
+    local base_dir="${work_dir}/build/baserom/images"
 
-    if [[ ! -f "$file" ]]; then
-        echo "Error: file '$file' not found"
-        return 1
+    [[ -z "$key" || -z "$new_value" ]] && { error "Usage: change_prop <key> <value>"; return 1; }
+    [[ -d "$base_dir" ]] || { error "Directory '$base_dir' not found!"; return 1; }
+
+    new_value="$(echo "$new_value" | tr -d '\r\n')"
+    local escaped_value
+    escaped_value="$(printf '%s\n' "$new_value" | sed 's/[\/&#]/\\&/g')"
+
+    local target_file
+    target_file="$(grep -rl --include="build.prop" -m1 "^${key}=" "$base_dir" 2>/dev/null | head -n1)"
+
+    if [[ -n "$target_file" ]]; then
+        sed -i -E "s#^(${key})=.*#\1=${escaped_value}#" "$target_file"
+        info "Updated '${key}' in $(basename "$(dirname "$target_file")")/build.prop"
+        return 0
     fi
+
+    local first_file
+    first_file="$(find "$base_dir" -name "build.prop" | head -n1)"
+    if [[ -n "$first_file" ]]; then
+        echo "${key}=${new_value}" >> "$first_file"
+        info "Appended '${key}' to $(basename "$(dirname "$first_file")")/build.prop"
+        return 0
+    fi
+
+    error "No build.prop files found in $base_dir"
+    return 1
+}
+
+# ─── init.rc helpers ─────────────────────────────────────────────────────────
+setprop_rc() {
+    local target_section="$1"
+    local insert_value="$2"
+    local file="$3"
+
+    [[ -f "$file" ]] || { error "File '$file' not found"; return 1; }
 
     local temp_file="${file}.tmp"
     local matched=0
 
     > "$temp_file"
-
     while IFS= read -r line; do
         echo "$line" >> "$temp_file"
-
         if [[ "$matched" -eq 0 && "$line" == "$target_section" ]]; then
             matched=1
             while IFS= read -r next_line; do
                 if [[ "$next_line" =~ ^[[:space:]] ]]; then
                     echo "$next_line" >> "$temp_file"
                 else
-                    # Insert your new value and break
                     while IFS= read -r value_line; do
                         [[ -n "$value_line" ]] && echo "    $value_line" >> "$temp_file"
                     done <<< "$insert_value"
@@ -217,71 +212,24 @@ setprop_rc() {
     mv "$temp_file" "$file"
 }
 
-change_prop() {
-    local key="$1"
-    local new_value="$2"
-    local base_dir="$work_dir/build/baserom/images"
-
-    if [[ -z "$key" || -z "$new_value" ]]; then
-        echo "[INFO] - Usage: change_prop <property_key> <new_value>" >&2
-        return 1
-    fi
-
-    if [[ ! -d "$base_dir" ]]; then
-        echo "[ERROR] -  Directory '$base_dir' not found!" >&2
-        return 1
-    fi
-
-    new_value=$(echo "$new_value" | tr -d '\r\n')
-    local escaped_value
-    escaped_value=$(printf '%s\n' "$new_value" | sed 's/[\/&#]/\\&/g')
-
-    local found_file=""
-    while IFS= read -r -d '' file; do
-        if grep -q -E "^$key=" "$file"; then
-            sed -i -E "s#^($key)=.*#\1=$escaped_value#" "$file"
-            echo "[SYSTEM] - Updated '$key'"
-            return 0
-        fi
-    done < <(find "$base_dir" -type f -name "build.prop" -print0)
-
-    # If key not found in any file, append to the first build.prop
-    local first_file
-    first_file=$(find "$base_dir" -type f -name "build.prop" | head -n1)
-
-    if [[ -n "$first_file" ]]; then
-        echo "$key=$new_value" >> "$first_file"
-        echo "[INFO] - Appended '$key=$new_value' to $first_file"
-        return 0
-    else
-        echo "[INFO] - No build.prop files found to update or append." >&2
-        return 1
-    fi
-}
-
-
+# ─── Smali file movers ───────────────────────────────────────────────────────
 mvsml() {
     local file_name="$1"
     local target_folder="$2"
     local framework_dir="$3"
 
-    file_path=$(find "$framework_dir" -type f -name "$file_name")
+    local file_path
+    file_path="$(find "$framework_dir" -type f -name "$file_name" | head -n1)"
+    [[ -z "$file_path" ]] && { echo "File $file_name not found in $framework_dir."; return 1; }
 
-    if [ -z "$file_path" ]; then
-        echo "File $file_name not found in any dex folder within $framework_dir."
-        return 1
-    fi
-
-    parent_dex_folder=$(dirname "$file_path" | sed "s|$framework_dir/||" | cut -d/ -f1)
-    relative_path=$(echo "$file_path" | sed "s|$framework_dir/$parent_dex_folder/||")
-
-    target_path="$target_folder/$relative_path"
+    local parent_dex_folder relative_path target_path
+    parent_dex_folder="$(dirname "$file_path" | sed "s|${framework_dir}/||" | cut -d/ -f1)"
+    relative_path="$(echo "$file_path" | sed "s|${framework_dir}/${parent_dex_folder}/||")"
+    target_path="${target_folder}/${relative_path}"
 
     mkdir -p "$(dirname "$target_path")"
-
     mv "$file_path" "$target_path"
-
-    echo "Moved $file_name to $target_path"
+    echo "Moved $file_name → $target_path"
 }
 
 mvdir() {
@@ -289,23 +237,69 @@ mvdir() {
     local target_folder="$2"
     local framework_dir="$3"
 
-    folder_path=$(find "$framework_dir" -type d -name "$folder_name")
+    local folder_path
+    folder_path="$(find "$framework_dir" -type d -name "$folder_name" | head -n1)"
+    [[ -z "$folder_path" ]] && { echo "Folder $folder_name not found in $framework_dir."; return 1; }
 
-    if [ -z "$folder_path" ]; then
-        echo "Folder $folder_name not found in any dex folder within $framework_dir."
-        return 1
-    fi
-
-    find "$folder_path" -type f -name "*.smali" | while read -r file_path; do
-        parent_dex_folder=$(dirname "$file_path" | sed "s|$framework_dir/||" | cut -d/ -f1)
-        relative_path=$(echo "$file_path" | sed "s|$framework_dir/$parent_dex_folder/||")
-
-        target_path="$target_folder/$relative_path"
-
+    while IFS= read -r file_path; do
+        local parent_dex_folder relative_path target_path
+        parent_dex_folder="$(dirname "$file_path" | sed "s|${framework_dir}/||" | cut -d/ -f1)"
+        relative_path="$(echo "$file_path" | sed "s|${framework_dir}/${parent_dex_folder}/||")"
+        target_path="${target_folder}/${relative_path}"
         mkdir -p "$(dirname "$target_path")"
-
         mv "$file_path" "$target_path"
-    done
+    done < <(find "$folder_path" -type f -name "*.smali")
 
-    echo "Moved all .smali files from $folder_name to $target_folder"
+    echo "Moved all .smali files from $folder_name → $target_folder"
 }
+
+# ─── config.env validation ───────────────────────────────────────────────────
+validate_config() {
+    local cfg="${WORK_DIR}/config.env"
+
+    [[ -f "$cfg" ]] || { error "config.env not found at $cfg"; exit 1; }
+
+    local bool_keys=( "install_toolbox" "install_mods" )
+    local errors=0
+
+    while IFS='=' read -r key value || [[ -n "$key" ]]; do
+        # Skip blank lines and comments
+        [[ -z "$key" || "$key" == \#* ]] && continue
+        # Strip whitespace
+        key="${key// /}"
+        value="${value// /}"
+
+        if [[ -z "$value" ]]; then
+            warn "config.env: '$key' has no value — defaulting to 'false'"
+            sed -i "s|^${key}=.*|${key}=false|" "$cfg"
+            continue
+        fi
+
+        # Validate boolean keys
+        for bk in "${bool_keys[@]}"; do
+            if [[ "$key" == "$bk" ]]; then
+                if [[ "$value" != "true" && "$value" != "false" ]]; then
+                    error "config.env: '$key' must be 'true' or 'false', got '${value}'"
+                    (( errors++ )) || true
+                fi
+                break
+            fi
+        done
+    done < "$cfg"
+
+    (( errors == 0 )) || { error "config.env validation failed with ${errors} error(s)."; exit 1; }
+    info "config.env validated OK."
+}
+
+# ─── Read a single boolean config key safely ─────────────────────────────────
+# Usage: read_config <key>   →  echoes "true" or "false"
+read_config() {
+    local key="$1"
+    local cfg="${WORK_DIR}/config.env"
+    local val
+    val="$(grep -E "^${key}=" "$cfg" 2>/dev/null | cut -d'=' -f2 | tr -d '[:space:]')"
+    echo "${val:-false}"
+}
+
+# ─── Export for subshells & exported functions ───────────────────────────────
+export BIN_ARCH WORK_DIR

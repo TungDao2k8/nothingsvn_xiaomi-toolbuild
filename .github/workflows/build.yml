@@ -1,4 +1,4 @@
-name: NothingsVN Xiaomi ROM Build
+name: HyperK Xiaomi ROM Build
 
 on:
   workflow_dispatch:
@@ -6,71 +6,328 @@ on:
       input_url:
         description: 'URL of the ROM to build'
         required: true
-      
+
+concurrency:
+  group: rom-build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  Initialize:
+  build:
     runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      TG_TOKEN:        ${{ secrets.TG_TOKEN }}
+      TG_CHAT_ID:      ${{ secrets.TG_CHAT_ID }}
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+
     steps:
-      - name: Clean All Unused file,application
-        run: |
-          docker rmi `docker images -q` || true
-          sudo rm -rf /usr/share/dotnet /etc/mysql /etc/php /etc/sudo apt/sources.list.d || true
-          sudo apt -y purge azure-cli ghc* zulu* hhvm llvm* firefox google* dotnet* powershell mysql* php* || true
-          sudo apt -y autoremove --purge || true
-          sudo apt -y autoclean || true
-          sudo apt clean || true
+      # ── 1. Checkout repository ───────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v5
 
-      - name: Maximize build space
-        uses: easimon/maximize-build-space@master
-        with:
-          swap-size-mb: 1024
-          root-reserve-mb: 512
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'true'
-
-      - name: Set up Time
-        run: |
-          echo "Setting Vienam timezone"
-          sudo timedatectl set-timezone Asia/Ho_Chi_Minh
-          
-      - name: Install OpenJDK
-        uses: actions/setup-java@v4
+      # ── 2. Set up Java (bắt buộc tách riêng vì dùng `uses:`) ────────────────
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Checkout repository
-        uses: actions/checkout@main
-
-      - name: Install Stuff
+      # ── 3. Chuẩn bị toàn bộ môi trường trước khi build ──────────────────────
+      #    Gồm: validate secrets · link workspace · phân tích ROM · gửi thông báo
+      #         · tạo helper · dọn disk · cài múi giờ · cài deps · phân quyền
+      #         · vá bug jar_util
+      - name: Prepare build environment
         run: |
-          sudo bash setup.sh
-        
-      - name: Giving permission
-        run: |
-          sudo chmod 777 -R *
+          # ── Validate secrets ───────────────────────────────────────────────
+          missing=()
+          [[ -z "${{ secrets.TG_TOKEN }}"        ]] && missing+=("TG_TOKEN")
+          [[ -z "${{ secrets.TG_CHAT_ID }}"      ]] && missing+=("TG_CHAT_ID")
+          [[ -z "${{ secrets.PD_API_KEY }}"      ]] && missing+=("PD_API_KEY")
+          [[ -z "${{ secrets.DISCORD_WEBHOOK }}" ]] && missing+=("DISCORD_WEBHOOK")
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "Missing GitHub Secrets: ${missing[*]}"
+            exit 1
+          fi
+          echo "All required secrets are present."
 
-      - name: Build ROM...
+          # ── Link workspace ─────────────────────────────────────────────────
+          sudo mkdir -p /mnt/workspace
+          sudo ln -sfn "$GITHUB_WORKSPACE" /mnt/workspace/repo
+
+          # ── Phân tích thông tin ROM ────────────────────────────────────────
+          ROM_URL="${{ inputs.input_url }}"
+          ROM_FILENAME=$(basename "$ROM_URL" | sed 's/?.*//')
+          echo "ROM_FILENAME=$ROM_FILENAME" >> "$GITHUB_ENV"
+
+          touch "/tmp/${ROM_FILENAME}"
+          bash bin/ddevice/getROM.sh "/tmp/${ROM_FILENAME}" || true
+          rm -f "/tmp/${ROM_FILENAME}"
+
+          ROM_DEVICE=$(cat bin/ddevice/device_code.txt   2>/dev/null || echo "Unknown")
+          ROM_VERSION=$(cat bin/ddevice/base_rom_code.txt 2>/dev/null || echo "Unknown")
+          ROM_OS_CODE=$(cat bin/ddevice/rom_os.txt        2>/dev/null || echo "Unknown")
+          DEVICE_TYPE=$(cat bin/ddevice/device_type.txt   2>/dev/null || echo "Unknown")
+
+          case "$ROM_OS_CODE" in
+            OS3)    ROM_OS_DISPLAY="HyperOS 3" ;;
+            OS2)    ROM_OS_DISPLAY="HyperOS 2" ;;
+            OS1)    ROM_OS_DISPLAY="HyperOS 1" ;;
+            MIUI14) ROM_OS_DISPLAY="MIUI 14"   ;;
+            MIUI13) ROM_OS_DISPLAY="MIUI 13"   ;;
+            *)      ROM_OS_DISPLAY="$ROM_OS_CODE" ;;
+          esac
+
+          echo "ROM_DEVICE=$ROM_DEVICE"       >> "$GITHUB_ENV"
+          echo "ROM_VERSION=$ROM_VERSION"     >> "$GITHUB_ENV"
+          echo "ROM_OS=$ROM_OS_DISPLAY"       >> "$GITHUB_ENV"
+          echo "ROM_OS_CODE=$ROM_OS_CODE"     >> "$GITHUB_ENV"
+          echo "DEVICE_TYPE=$DEVICE_TYPE"     >> "$GITHUB_ENV"
+          echo "ROM_FILENAME=$ROM_FILENAME"   >> "$GITHUB_ENV"
+          # Export cục bộ để notify.sh (child process) kế thừa được trong cùng step
+          export ROM_DEVICE ROM_VERSION ROM_FILENAME ROM_OS_CODE DEVICE_TYPE
+          export ROM_OS="$ROM_OS_DISPLAY"
+
+          # ── Gửi thông báo bắt đầu ─────────────────────────────────────────
+          BUILD_START=$(date +%s)
+          echo "BUILD_START=$BUILD_START" >> $GITHUB_ENV
+          export BUILD_START
+          FNAME_SHORT=$(echo "$ROM_FILENAME" | cut -c1-45)
+          [[ "${#ROM_FILENAME}" -gt 45 ]] && FNAME_SHORT="${FNAME_SHORT}…"
+
+          RESPONSE=$(curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            -d chat_id="${TG_CHAT_ID}" \
+            -d parse_mode="HTML" \
+            --data-urlencode text="🛠 <b>NothingsVN ROM Builder</b>
+          ══════════════════════════
+          📱 <b>Device :</b>  <code>${ROM_DEVICE}</code>
+          🗂 <b>OS     :</b>  ${ROM_OS_DISPLAY}
+          📦 <b>Version:</b>  <code>${ROM_VERSION}</code>
+          📄 <b>File   :</b>  <code>${FNAME_SHORT}</code>
+          ══════════════════════════
+          ⬛⬛⬛⬛⬛  <i>0 / 5 — Đang chuẩn bị...</i>
+          ══════════════════════════
+          <a href='https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}'>🔗 Xem Logs</a>")
+
+          MSG_ID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['message_id'])" 2>/dev/null || echo "")
+          echo "TG_MSG_ID=$MSG_ID" >> $GITHUB_ENV
+          # Export cục bộ để notify.sh 1/2/3 dùng được trong cùng step này
+          export TG_MSG_ID="$MSG_ID"
+
+          DISCORD_RESPONSE=$(curl -s -X POST "${DISCORD_WEBHOOK}?wait=true" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "embeds": [{
+                "title": "🔨 Build Started",
+                "color": 3447003,
+                "fields": [
+                  { "name": "📱 Device",  "value": "'"${ROM_DEVICE}"'",      "inline": true },
+                  { "name": "🗂 OS",      "value": "'"${ROM_OS_DISPLAY}"'",  "inline": true },
+                  { "name": "📦 Version", "value": "'"${ROM_VERSION}"'",     "inline": true },
+                  { "name": "📄 File",    "value": "'"${FNAME_SHORT}"'",     "inline": false },
+                  { "name": "🔗 Logs",    "value": "[View Logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})", "inline": false }
+                ],
+                "footer": { "text": "⏳ Đang chuẩn bị..." },
+                "timestamp": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"
+              }]
+            }')
+          DISCORD_MSG_ID=$(echo "$DISCORD_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])" 2>/dev/null || echo "")
+          echo "DISCORD_MSG_ID=$DISCORD_MSG_ID" >> $GITHUB_ENV
+          export DISCORD_MSG_ID="$DISCORD_MSG_ID"
+
+          # ── Tạo notify helper script ───────────────────────────────────────
+          cat > /tmp/notify.sh << 'SCRIPT'
+          #!/bin/bash
+          STEP_NUM="${1:-0}"
+          STEP_NAME_ARG="${2:-}"
+          ELAPSED_SEC=$(( $(date +%s) - ${BUILD_START:-$(date +%s)} ))
+          ELAPSED_MIN=$(( ELAPSED_SEC / 60 ))
+          ELAPSED_S=$(( ELAPSED_SEC % 60 ))
+          ELAPSED_LABEL="${ELAPSED_MIN} phút ${ELAPSED_S} giây"
+
+          declare -a STEP_LABELS=("" "🗑 Dọn dung lượng disk" "📦 Cài đặt dependencies" "🔨 Build ROM" "🗜 Đóng gói ROM" "☁️ Upload lên Pixeldrain")
+          STEP_NAME="${STEP_NAME_ARG:-${STEP_LABELS[$STEP_NUM]}}"
+
+          BAR=""
+          for i in 1 2 3 4 5; do
+            if [[ $i -lt $STEP_NUM ]]; then BAR+="🟩"
+            elif [[ $i -eq $STEP_NUM ]]; then BAR+="🟨"
+            else BAR+="⬛"
+            fi
+          done
+
+          curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/editMessageText" \
+            -d chat_id="${TG_CHAT_ID}" \
+            -d message_id="${TG_MSG_ID}" \
+            -d parse_mode="HTML" \
+            --data-urlencode text="🛠 <b>NothingsVN ROM Builder</b>
+          ══════════════════════════
+          📱 <b>Device :</b>  <code>${ROM_DEVICE}</code>
+          🗂 <b>OS     :</b>  ${ROM_OS}
+          📦 <b>Version:</b>  <code>${ROM_VERSION}</code>
+          ══════════════════════════
+          ${BAR}  <b>${STEP_NUM} / 5</b>
+          📌 <b>Bước hiện tại:</b> ${STEP_NAME}
+          ⏱ <b>Đã chạy:</b> ${ELAPSED_LABEL}
+          ══════════════════════════
+          <a href='https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}'>🔗 Xem Logs</a>" > /dev/null
+
+          curl -s -X PATCH "${DISCORD_WEBHOOK}/messages/${DISCORD_MSG_ID}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "embeds": [{
+                "title": "🔨 Build In Progress",
+                "color": 16776960,
+                "fields": [
+                  { "name": "📱 Device",  "value": "'"${ROM_DEVICE}"'",   "inline": true },
+                  { "name": "🗂 OS",      "value": "'"${ROM_OS}"'",       "inline": true },
+                  { "name": "📦 Version", "value": "'"${ROM_VERSION}"'",  "inline": true },
+                  { "name": "📄 File",    "value": "'"${ROM_FILENAME}"'", "inline": false },
+                  { "name": "🔗 Logs",    "value": "[View Logs](https://github.com/'"${GITHUB_REPOSITORY}"'/actions/runs/'"${GITHUB_RUN_ID}"')", "inline": false }
+                ],
+                "footer": { "text": "'"${STEP_NAME}"' | ⏱ '"${ELAPSED_LABEL}"'" },
+                "timestamp": "'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"
+              }]
+            }' > /dev/null
+          SCRIPT
+          chmod +x /tmp/notify.sh
+
+          # ── [1/5] Dọn dung lượng disk ──────────────────────────────────────
+          bash /tmp/notify.sh 1
+          sudo apt-get purge -yq '^aspnetcore-.*' '^dotnet-.*' azure-cli google-chrome-stable firefox powershell snapd > /dev/null 2>&1
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc "$AGENT_TOOLSDIRECTORY"
+          sudo apt-get autoremove -yq > /dev/null 2>&1
+          sudo swapoff -a || true
+          sudo fallocate -l 8G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile > /dev/null
+          sudo swapon /mnt/swapfile
+
+          # Cài đặt múi giờ
+          sudo timedatectl set-timezone Asia/Ho_Chi_Minh
+
+          # ── [2/5] Cài đặt dependencies ─────────────────────────────────────
+          bash /tmp/notify.sh 2
+          bash setup.sh
+
+          # Phân quyền scripts
+          find bin -type f -exec chmod +x {} +
+          chmod +x build.sh packROM.sh uploadROM.sh setup.sh
+
+          # ── Vá lỗi $4 unbound variable trong jar_util() ────────────────────
+          FILES=(
+            "bin/package/NOTIFICATION_FIX/A12/patchMIUIServices.sh"
+            "bin/package/NOTIFICATION_FIX/A12/patchMIUIFramework.sh"
+            "bin/package/NOTIFICATION_FIX/A13/patchMIUIServices.sh"
+            "bin/package/NOTIFICATION_FIX/A13/patchMIUIFramework.sh"
+            "bin/package/NOTIFICATION_FIX/A14/patchMIUIServices.sh"
+            "bin/package/NOTIFICATION_FIX/A14/patchMIUIFramework.sh"
+            "bin/package/NOTIFICATION_FIX/A15/patchMIUIServices.sh"
+            "bin/package/KouseiPatcher/patcher.sh"
+          )
+          for f in "${FILES[@]}"; do
+            [[ -f "$f" ]] || continue
+            sed -i 's/if \[\[ \$3 == /if [[ ${3:-} == /g' "$f"
+            sed -i 's/if \[\[ \$4 \]\]/if [[ ${4:-} ]]/g' "$f"
+            sed -i 's/\*"\$4"\*/\*"${4:-}"\*/g' "$f"
+            echo "  [PATCHED] $f"
+          done
+
+          # Báo hiệu sẵn sàng bước Build ROM
+          bash /tmp/notify.sh 3
+
+      # ── 4. Build ROM ─────────────────────────────────────────────────────────
+      - name: Build ROM
+        run: |
+          bash build.sh "${{ inputs.input_url }}"
+          bash /tmp/notify.sh 4
+
+      # ── 5. Pack ROM (bao gồm repack flash file) ──────────────────────────────
+      - name: Pack ROM
+        run: |
+          bash packROM.sh
+          # ↓ Repack flash file (chuyển về đây từ uploadROM.sh)
+          bash /tmp/notify.sh 5
+
+      # ── 6. Upload ROM ────────────────────────────────────────────────────────
+      - name: Upload ROM to Pixeldrain
+        id: upload
         env:
-          INPUT_URL: ${{ inputs.input_url }}
-        run: |
-          sudo bash build.sh "$INPUT_URL"
+          PD_API_KEY: ${{ secrets.PD_API_KEY }}
+        run: bash uploadROM.sh
 
-      - name: Pack ROM...
+      # ── 7. Final Status ──────────────────────────────────────────────────────
+      - name: Notify - Build successful
+        if: success()
         run: |
-          sudo bash packROM.sh
+          ELAPSED_SEC=$(( $(date +%s) - ${BUILD_START} ))
+          ELAPSED_MIN=$(( ELAPSED_SEC / 60 ))
+          ELAPSED_S=$(( ELAPSED_SEC % 60 ))
+          ELAPSED_LABEL="${ELAPSED_MIN} phút ${ELAPSED_S} giây"
 
-      - name: Setup Rclone...
+          curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/editMessageText" \
+            -d chat_id="${TG_CHAT_ID}" \
+            -d message_id="${TG_MSG_ID}" \
+            -d parse_mode="HTML" \
+            --data-urlencode text="✅ <b>Build Thành Công!</b>
+          ══════════════════════════
+          📱 <b>Device :</b>  <code>${ROM_DEVICE}</code>
+          🗂 <b>OS     :</b>  ${ROM_OS}
+          📦 <b>Version:</b>  <code>${ROM_VERSION}</code>
+          ══════════════════════════
+          🟩🟩🟩🟩🟩  <b>5 / 5 — Hoàn tất!</b>
+          ══════════════════════════
+          📁 <b>Output   :</b>  ${{ steps.upload.outputs.ROM_NAME }}
+          📥 <b>Download :</b>  ${{ steps.upload.outputs.PD_LINK }}
+          ⏱ <b>Tổng thời gian:</b>  ${ELAPSED_LABEL}
+          ══════════════════════════
+          <a href='https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}'>🔗 Xem Logs</a>" > /dev/null
+
+          curl -s -X PATCH "${DISCORD_WEBHOOK}/messages/${DISCORD_MSG_ID}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "embeds": [{
+                "title": "✅ Build Thành Công!",
+                "color": 3066993,
+                "fields": [
+                  { "name": "📱 Device",   "value": "'"${ROM_DEVICE}"'",  "inline": true },
+                  { "name": "🗂 OS",       "value": "'"${ROM_OS}"'",      "inline": true },
+                  { "name": "📦 Version",  "value": "'"${ROM_VERSION}"'", "inline": true },
+                  { "name": "📥 Download", "value": "${{ steps.upload.outputs.PD_LINK }}", "inline": false },
+                  { "name": "⏱ Thời gian","value": "'"${ELAPSED_LABEL}"'", "inline": false }
+                ],
+                "footer": { "text": "Build hoàn tất!" }
+              }]
+            }' > /dev/null
+
+      - name: Notify - Build failed
+        if: failure()
         run: |
-          sudo -E bash uploadROM.sh setup "${{ secrets.GH_TOKEN }}" "${{ secrets.GH_REPO }}" "${{ secrets.RCLONE_TOKEN_PATH }}"
-          
-      - name: Upload ROM...
-        run: |
-          sudo -E bash uploadROM.sh
-      
-      - name: Update Database and Notificaton to Telegram
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TG_TOKEN }}
-        run: |
-          
+          curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/editMessageText" \
+            -d chat_id="${TG_CHAT_ID}" \
+            -d message_id="${TG_MSG_ID}" \
+            -d parse_mode="HTML" \
+            --data-urlencode text="❌ <b>Build Thất Bại!</b>
+          ══════════════════════════
+          📱 <b>Device :</b>  <code>${ROM_DEVICE}</code>
+          🗂 <b>OS     :</b>  ${ROM_OS}
+          📦 <b>Version:</b>  <code>${ROM_VERSION}</code>
+          ══════════════════════════
+          ⚠️ <i>Xem logs để biết chi tiết lỗi.</i>
+          ══════════════════════════
+          <a href='https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}'>🔗 Xem Logs</a>" > /dev/null
+
+          curl -s -X PATCH "${DISCORD_WEBHOOK}/messages/${DISCORD_MSG_ID}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "embeds": [{
+                "title": "❌ Build Thất Bại!",
+                "color": 15158332,
+                "fields": [
+                  { "name": "📱 Device",  "value": "'"${ROM_DEVICE}"'",  "inline": true },
+                  { "name": "🗂 OS",      "value": "'"${ROM_OS}"'",      "inline": true },
+                  { "name": "📦 Version", "value": "'"${ROM_VERSION}"'", "inline": true },
+                  { "name": "🔗 Logs",    "value": "[View Logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})", "inline": false }
+                ],
+                "footer": { "text": "Xem logs để biết chi tiết lỗi." }
+              }]
+            }' > /dev/null

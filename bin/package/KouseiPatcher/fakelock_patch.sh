@@ -43,5 +43,5 @@ if [[ $sdkLevel == "32" || $sdkLevel == "31" ]];then
 cat $prop/cust.prop >> $work_dir/build/baserom/images/system/system/etc/cust/cust_prop_white_keys_list
 else
 cat $prop/cust.prop >> $work_dir/build/baserom/images/system_ext/etc/cust_prop_white_keys_list
-patch "Done"
+echo "Done"
 fi

@@ -4,11 +4,23 @@ sdkLevel=$(cat $work_dir/bin/ddevice/sdkLevel.txt)
 deviceTYPE=$(cat $work_dir/bin/ddevice/device_type.txt)
 rom_os=$(cat $work_dir/bin/ddevice/rom_os.txt)
 
+# ─────────────────────────────────────────────────────────────────
+# BUG FIX: functions.sh dùng `set -euo pipefail`.
+#   Cờ `-u` khiến mọi tham chiếu đến biến CHƯA SET đều là fatal error.
+#
+# jar_util() nhận tối đa 4 tham số nhưng thường chỉ được gọi với 2-3:
+#   jar_util d "miui-services.jar" fw   → $4 = UNSET → crash tại line 25
+#   jar_util a "miui-services.jar"      → $3 = UNSET → crash tại line 11
+#
+# FIX: Dùng ${3:-} và ${4:-} (default = chuỗi rỗng) để an toàn với -u.
+# ─────────────────────────────────────────────────────────────────
+
 jar_util() 
 {
     cd $work_dir
     #binary
-    if [[ $3 == "fw" ]]; then 
+    # FIX: ${3:-} thay vì $3 — tránh "unbound variable" khi chỉ truyền 2 arg
+    if [[ ${3:-} == "fw" ]]; then 
         bak="java -jar $work_dir/bin/apktool/baksmaliv2.jar d --api $sdkLevel"
         sma="java -jar $work_dir/bin/apktool/smaliv2.jar a --api $sdkLevel"
     fi
@@ -22,8 +34,9 @@ jar_util()
             if [[ -d $work_dir/jar_temp/"$2.out" ]]; then
                 rm -rf $work_dir/jar_temp/$2
                 for dex in $(find $work_dir/jar_temp/"$2.out" -maxdepth 1 -name "*dex" ); do
-                    if [[ $4 ]]; then
-                        if [[ ! "$dex" == *"$4"* ]]; then
+                    # FIX: ${4:-} thay vì $4 — tránh crash khi không truyền arg thứ 4
+                    if [[ -n "${4:-}" ]]; then
+                        if [[ ! "$dex" == *"${4:-}"* ]]; then
                             $bak $dex -o "$dex.out"
                             [[ -d "$dex.out" ]] && rm -rf $dex
                         fi
@@ -42,8 +55,9 @@ jar_util()
             if [[ -d $work_dir/jar_temp/$2.out ]]; then
                 cd $work_dir/jar_temp/$2.out
                 for fld in $(find -maxdepth 1 -name "*.out" ); do
-                    if [[ $4 ]]; then
-                        if [[ ! "$fld" == *"$4"* ]]; then
+                    # FIX: ${4:-} thay vì $4 — tránh crash khi không truyền arg thứ 4
+                    if [[ -n "${4:-}" ]]; then
+                        if [[ ! "$fld" == *"${4:-}"* ]]; then
                             $sma $fld -o $(echo ${fld//.out})
                             [[ -f $(echo ${fld//.out}) ]] && rm -rf $fld
                         fi
@@ -73,7 +87,7 @@ find_and_replace_miui() {
     local replace=$2
     local base_dir=$work_dir/jar_temp/miui-services.jar.out
     local files=(
-        "MiuiKeyShortcutManager$MiuiOtherSettingsObserver.smali"
+        "MiuiKeyShortcutManager\$MiuiOtherSettingsObserver.smali"
     )
 
     for file in "${files[@]}"; do
@@ -91,7 +105,7 @@ find_and_replace_hyperos() {
     local replace=$2
     local base_dir=$work_dir/jar_temp/miui-services.jar.out
     local files=(
-        "MiuiShortcutTriggerHelper$ShortcutSettingsObserver.smali"
+        "MiuiShortcutTriggerHelper\$ShortcutSettingsObserver.smali"
     )
 
     for file in "${files[@]}"; do

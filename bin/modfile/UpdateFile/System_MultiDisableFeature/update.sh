@@ -58,9 +58,14 @@ else
 fi
 
 fix_themereset() {
-    InitRC1=$(find $work_dir/build/baserom/images -type f -name "init.rc")
+    # FIX: head -n1 to avoid multi-file result; guard empty; quote variable
+    InitRC1=$(find $work_dir/build/baserom/images -type f -name "init.rc" | head -n1)
+    if [[ -z "$InitRC1" ]]; then
+        echo "[WARN] init.rc not found — skipping theme reset fix."
+        return 0
+    fi
     mods "Fix theme reset"
-    sed -i '/on boot/a\'$'\n''    chmod 0731 \/data\/system\/theme' $InitRC1
+    sed -i '/on boot/a\'$'\n''    chmod 0731 \/data\/system\/theme' "$InitRC1"
     mods "Done"
 }
 

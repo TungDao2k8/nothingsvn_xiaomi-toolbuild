@@ -1,9 +1,9 @@
 work_dir=$(pwd)
 source $work_dir/functions.sh
 repS="python3 $work_dir/bin/strRep.py"
-if [[ ! -d $dir/jar_temp ]]; then
+if [[ ! -d $work_dir/jar_temp ]]; then
 
-	mkdir $dir/jar_temp
+	mkdir $work_dir/jar_temp
 	
 fi
 
